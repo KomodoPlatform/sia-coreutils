@@ -207,3 +207,52 @@ func TestnetZen() (*consensus.Network, types.Block) {
 
 	return n, b
 }
+
+func TestnetKomodo() (*consensus.Network, types.Block) {
+	n := &consensus.Network{
+		Name: "komodo",
+
+		InitialCoinbase: types.Siacoins(300000),
+		MinimumCoinbase: types.Siacoins(300000),
+		InitialTarget:   types.BlockID{0: 1}, // significantly reduced POW diff
+	}
+
+	n.HardforkDevAddr.Height = 1
+	n.HardforkDevAddr.OldAddress = types.Address{}
+	n.HardforkDevAddr.NewAddress = types.Address{}
+
+	n.HardforkTax.Height = 2
+
+	n.HardforkStorageProof.Height = 3
+
+	n.HardforkOak.Height = 5
+	n.HardforkOak.FixHeight = 8
+	n.HardforkOak.GenesisTimestamp = time.Unix(1702300000, 0) // Dec 11, 2023 @ 13:06 GMT
+
+	n.HardforkASIC.Height = 13
+	n.HardforkASIC.OakTime = 10 * time.Minute
+	n.HardforkASIC.OakTarget = n.InitialTarget
+
+	n.HardforkFoundation.Height = 21
+	n.HardforkFoundation.PrimaryAddress, _ = types.ParseAddress("addr:591fcf237f8854b5653d1ac84ae4c107b37f148c3c7b413f292d48db0c25a8840be0653e411f") // Address controlled by Alrighttt
+	n.HardforkFoundation.FailsafeAddress = n.HardforkFoundation.PrimaryAddress
+
+	n.HardforkV2.AllowHeight = 10        // activate immediately
+	n.HardforkV2.RequireHeight = 7777777 // remain in flux state v1/v2 transition indefinitely
+
+	b := types.Block{
+		Timestamp: n.HardforkOak.GenesisTimestamp,
+		Transactions: []types.Transaction{{
+			SiacoinOutputs: []types.SiacoinOutput{{
+				Address: n.HardforkFoundation.PrimaryAddress,
+				Value:   types.Siacoins(1).Mul64(1e12),
+			}},
+			SiafundOutputs: []types.SiafundOutput{{
+				Address: n.HardforkFoundation.PrimaryAddress,
+				Value:   10000,
+			}},
+		}},
+	}
+
+	return n, b
+}
