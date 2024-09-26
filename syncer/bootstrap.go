@@ -57,4 +57,6 @@ var (
 		"15.204.160.10:10881",
 		"51.81.56.133:9881",
 	}
+
+	KomodoBootstrapPeers = []string{}
 )
