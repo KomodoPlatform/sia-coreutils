@@ -16,6 +16,3 @@ require (
 	go.uber.org/multierr v1.10.0 // indirect
 	golang.org/x/sys v0.24.0 // indirect
 )
-
-replace go.sia.tech/core => github.com/alrighttt/core v0.0.0-20240817151302-1b7d22764744
-// replace go.sia.tech/core => ../core
