@@ -168,6 +168,8 @@ func TestnetKomodo() (*consensus.Network, types.Block) {
 		InitialCoinbase: types.Siacoins(300000),
 		MinimumCoinbase: types.Siacoins(300000),
 		InitialTarget:   types.BlockID{0: 1}, // significantly reduced POW diff
+		BlockInterval:   1 * time.Minute,
+		MaturityDelay:   10,
 	}
 
 	n.HardforkDevAddr.Height = 1
