@@ -1879,7 +1879,7 @@ func TestSingleAddressWalletEventTypes(t *testing.T) {
 	})
 }
 
-func TestV2TPoolRace(t *testing.T) {
+func TestV2TxPoolRace(t *testing.T) {
 	// create wallet store
 	pk := types.GeneratePrivateKey()
 	ws := testutil.NewEphemeralWalletStore()
@@ -1946,11 +1946,16 @@ func TestV2TPoolRace(t *testing.T) {
 	// output in the spend transaction invalid unless it is updated.
 	mineAndSync(t, cm, ws, w, types.VoidAddress, 1)
 
-	// broadcast the transaction set including the already confirmed setup
-	// transaction. This seems unnecessary, but it's a fairly common occurrence
-	// when passing transaction sets using unconfirmed outputs between a renter
-	// and host. If the transaction set is not updated correctly, it will fail.
-	if _, err := cm.AddV2PoolTransactions(basis, []types.V2Transaction{setupTxn, spendTxn}); err != nil {
+	// now that the setup transaction has been accepted, we can't include it in
+	// the set anymore, or we'll get a double-spend error. AddV2PoolTransactions
+	// will internally replace the ephemeral output, making spendTxn valid.
+	if _, err := cm.AddV2PoolTransactions(basis, []types.V2Transaction{spendTxn}); err != nil {
 		t.Fatal(err)
+	}
+	// updating the transaction shouldn't change its ID
+	if spendTxn, ok := cm.V2PoolTransaction(spendTxn.ID()); !ok {
+		t.Fatal("expected spend transaction to be in pool")
+	} else if spendTxn.SiacoinInputs[0].Parent.StateElement.LeafIndex == types.UnassignedLeafIndex {
+		t.Fatal("expected ephemeral output to be replaced")
 	}
 }
