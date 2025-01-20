@@ -42,7 +42,7 @@ func TestSyncer(t *testing.T) {
 	}
 	defer l2.Close()
 
-	s1 := syncer.New(l1, cm1, testutil.NewMemPeerStore(), gateway.Header{
+	s1 := syncer.New(l1, cm1, testutil.NewEphemeralPeerStore(), gateway.Header{
 		GenesisID:  genesis.ID(),
 		UniqueID:   gateway.GenerateUniqueID(),
 		NetAddress: l1.Addr().String(),
@@ -50,7 +50,7 @@ func TestSyncer(t *testing.T) {
 	defer s1.Close()
 	go s1.Run(context.Background())
 
-	s2 := syncer.New(l2, cm2, testutil.NewMemPeerStore(), gateway.Header{
+	s2 := syncer.New(l2, cm2, testutil.NewEphemeralPeerStore(), gateway.Header{
 		GenesisID:  genesis.ID(),
 		UniqueID:   gateway.GenerateUniqueID(),
 		NetAddress: l2.Addr().String(),
@@ -80,12 +80,7 @@ func TestSyncer(t *testing.T) {
 	}
 
 	// broadcast the tip from s1 to s2
-	s1.BroadcastHeader(gateway.BlockHeader{
-		ParentID:   b.ParentID,
-		Nonce:      b.Nonce,
-		Timestamp:  b.Timestamp,
-		MerkleRoot: b.MerkleRoot(),
-	})
+	s1.BroadcastHeader(b.Header())
 
 	for i := 0; i < 100; i++ {
 		if cm1.Tip() == cm2.Tip() {

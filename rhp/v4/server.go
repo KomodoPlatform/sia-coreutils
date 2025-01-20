@@ -17,17 +17,6 @@ import (
 	"lukechampine.com/frand"
 )
 
-const (
-	sectorsPerTiB = (1 << 40) / (1 << 22)
-	memoryPer1TiB = sectorsPerTiB * 32
-
-	sectorsPer10TiB = 10 * sectorsPerTiB
-	memoryPer10TiB  = sectorsPer10TiB * 32
-
-	sectorsPer100TiB = 100 * sectorsPerTiB
-	memoryPer100TiB  = sectorsPer100TiB * 32
-)
-
 var protocolVersion = [3]byte{4, 0, 0}
 
 type (
@@ -99,8 +88,10 @@ type (
 
 	// A RevisionState pairs a contract revision with its sector roots.
 	RevisionState struct {
-		Revision types.V2FileContract
-		Roots    []types.Hash256
+		Revision  types.V2FileContract
+		Renewed   bool
+		Revisable bool
+		Roots     []types.Hash256
 	}
 
 	// Contractor is an interface for managing a host's contracts.
@@ -134,9 +125,8 @@ type (
 
 	// A Server handles incoming RHP4 RPC.
 	Server struct {
-		hostKey                   types.PrivateKey
-		priceTableValidity        time.Duration
-		contractProofWindowBuffer uint64
+		hostKey            types.PrivateKey
+		priceTableValidity time.Duration
 
 		chain      ChainManager
 		syncer     Syncer
@@ -147,18 +137,15 @@ type (
 	}
 )
 
-func (s *Server) lockContractForRevision(contractID types.FileContractID) (rev RevisionState, unlock func(), _ error) {
-	rev, unlock, err := s.contractor.LockV2Contract(contractID)
+func (s *Server) lockContractForRevision(contractID types.FileContractID) (RevisionState, func(), error) {
+	rs, unlock, err := s.contractor.LockV2Contract(contractID)
 	if err != nil {
 		return RevisionState{}, nil, fmt.Errorf("failed to lock contract: %w", err)
-	} else if rev.Revision.ProofHeight <= s.chain.Tip().Height+s.contractProofWindowBuffer {
+	} else if !rs.Revisable {
 		unlock()
-		return RevisionState{}, nil, errorBadRequest("contract too close to proof window")
-	} else if rev.Revision.RevisionNumber >= types.MaxRevisionNumber {
-		unlock()
-		return RevisionState{}, nil, errorBadRequest("contract is locked for revision")
+		return RevisionState{}, nil, errorBadRequest("contract is not revisable")
 	}
-	return rev, unlock, nil
+	return rs, unlock, nil
 }
 
 func (s *Server) handleRPCSettings(stream net.Conn) error {
@@ -232,9 +219,7 @@ func (s *Server) handleRPCWriteSector(stream net.Conn) error {
 	var req rhp4.RPCWriteSectorRequest
 	if err := rhp4.ReadRequest(stream, &req); err != nil {
 		return errorDecodingError("failed to read request: %v", err)
-	}
-	settings := s.settings.RHP4Settings()
-	if err := req.Validate(s.hostKey.PublicKey(), settings.MaxSectorDuration); err != nil {
+	} else if err := req.Validate(s.hostKey.PublicKey()); err != nil {
 		return errorBadRequest("request invalid: %v", err)
 	}
 	prices := req.Prices
@@ -253,12 +238,12 @@ func (s *Server) handleRPCWriteSector(stream net.Conn) error {
 		return errorDecodingError("failed to read sector data: %v", err)
 	}
 
-	usage := prices.RPCWriteSectorCost(req.DataLength, req.Duration)
+	usage := prices.RPCWriteSectorCost(req.DataLength)
 	if err = s.contractor.DebitAccount(req.Token.Account, usage); err != nil {
 		return fmt.Errorf("failed to debit account: %w", err)
 	}
 
-	if err := s.sectors.StoreSector(root, &sector, req.Duration); err != nil {
+	if err := s.sectors.StoreSector(root, &sector, prices.TipHeight+rhp4.TempSectorDuration); err != nil {
 		return fmt.Errorf("failed to store sector: %w", err)
 	}
 	return rhp4.WriteResponse(stream, &rhp4.RPCWriteSectorResponse{
@@ -283,9 +268,7 @@ func (s *Server) handleRPCFreeSectors(stream net.Conn) error {
 	}
 
 	fc := state.Revision
-
-	settings := s.settings.RHP4Settings()
-	if err := req.Validate(s.hostKey.PublicKey(), fc, settings.MaxSectorBatchSize); err != nil {
+	if err := req.Validate(s.hostKey.PublicKey(), fc); err != nil {
 		return errorBadRequest("request invalid: %v", err)
 	}
 	prices := req.Prices
@@ -347,8 +330,7 @@ func (s *Server) handleRPCAppendSectors(stream net.Conn) error {
 		return errorDecodingError("failed to read request: %v", err)
 	}
 
-	settings := s.settings.RHP4Settings()
-	if err := req.Validate(s.hostKey.PublicKey(), settings.MaxSectorBatchSize); err != nil {
+	if err := req.Validate(s.hostKey.PublicKey()); err != nil {
 		return errorBadRequest("request invalid: %v", err)
 	}
 
@@ -440,6 +422,7 @@ func (s *Server) handleRPCFundAccounts(stream net.Conn) error {
 	if !revision.RenterPublicKey.VerifyHash(sigHash, req.RenterSignature) {
 		return rhp4.ErrInvalidSignature
 	}
+	revision.RenterSignature = req.RenterSignature
 	revision.HostSignature = s.hostKey.SignHash(sigHash)
 
 	balances, err := s.contractor.CreditAccountsWithContract(req.Deposits, req.ContractID, revision, usage)
@@ -466,7 +449,9 @@ func (s *Server) handleRPCLatestRevision(stream net.Conn) error {
 	unlock()
 
 	return rhp4.WriteResponse(stream, &rhp4.RPCLatestRevisionResponse{
-		Contract: state.Revision,
+		Contract:  state.Revision,
+		Revisable: state.Revisable,
+		Renewed:   state.Renewed,
 	})
 }
 
@@ -483,8 +468,7 @@ func (s *Server) handleRPCSectorRoots(stream net.Conn) error {
 	defer unlock()
 
 	// validate the request fields
-	settings := s.settings.RHP4Settings()
-	if err := req.Validate(s.hostKey.PublicKey(), state.Revision, settings.MaxSectorBatchSize); err != nil {
+	if err := req.Validate(s.hostKey.PublicKey(), state.Revision); err != nil {
 		return rhp4.NewRPCError(rhp4.ErrorCodeBadRequest, err.Error())
 	}
 	prices := req.Prices
@@ -504,6 +488,7 @@ func (s *Server) handleRPCSectorRoots(stream net.Conn) error {
 
 	// sign the revision
 	revision.HostSignature = s.hostKey.SignHash(sigHash)
+	revision.RenterSignature = req.RenterSignature
 
 	// update the contract
 	err = s.contractor.ReviseV2Contract(req.ContractID, revision, state.Roots, usage)
@@ -581,6 +566,7 @@ func (s *Server) handleRPCFormContract(stream net.Conn) error {
 		})
 	}
 
+	var broadcast bool
 	// fund the host collateral
 	basis, toSign, err := s.wallet.FundV2Transaction(&formationTxn, hostCost, true)
 	if errors.Is(err, wallet.ErrNotEnoughFunds) {
@@ -588,6 +574,13 @@ func (s *Server) handleRPCFormContract(stream net.Conn) error {
 	} else if err != nil {
 		return fmt.Errorf("failed to fund transaction: %w", err)
 	}
+	defer func() {
+		if broadcast {
+			return
+		}
+		// release the inputs if the transaction is not going to be broadcast
+		s.wallet.ReleaseInputs(nil, []types.V2Transaction{formationTxn})
+	}()
 	// sign the transaction inputs
 	s.wallet.SignV2Inputs(&formationTxn, toSign)
 	// send the host inputs to the renter
@@ -600,14 +593,14 @@ func (s *Server) handleRPCFormContract(stream net.Conn) error {
 
 	// update renter input basis to reflect our funding basis
 	if basis != req.Basis {
-		hostInputs := formationTxn.SiacoinInputs[len(formationTxn.SiacoinInputs)-len(req.RenterInputs)]
-		formationTxn.SiacoinInputs = formationTxn.SiacoinInputs[:len(formationTxn.SiacoinInputs)-len(req.RenterInputs)]
+		hostInputs := formationTxn.SiacoinInputs[len(req.RenterInputs):]
+		formationTxn.SiacoinInputs = formationTxn.SiacoinInputs[:len(req.RenterInputs)]
 		txnset, err := s.chain.UpdateV2TransactionSet([]types.V2Transaction{formationTxn}, req.Basis, basis)
 		if err != nil {
 			return errorBadRequest("failed to update renter inputs from %q to %q: %v", req.Basis, basis, err)
 		}
 		formationTxn = txnset[0]
-		formationTxn.SiacoinInputs = append(formationTxn.SiacoinInputs, hostInputs)
+		formationTxn.SiacoinInputs = append(formationTxn.SiacoinInputs, hostInputs...)
 	}
 
 	// read the renter's signatures
@@ -626,8 +619,8 @@ func (s *Server) handleRPCFormContract(stream net.Conn) error {
 	formationTxn.FileContracts[0].RenterSignature = renterSigResp.RenterContractSignature
 
 	// add the renter signatures to the transaction
-	for i := range formationTxn.SiacoinInputs[:len(req.RenterInputs)] {
-		formationTxn.SiacoinInputs[i].SatisfiedPolicy = renterSigResp.RenterSatisfiedPolicies[i]
+	for i, policy := range renterSigResp.RenterSatisfiedPolicies {
+		formationTxn.SiacoinInputs[i].SatisfiedPolicy = policy
 	}
 
 	// add our signature to the contract
@@ -648,7 +641,6 @@ func (s *Server) handleRPCFormContract(stream net.Conn) error {
 	} else if _, err = s.chain.AddV2PoolTransactions(basis, formationSet); err != nil {
 		return errorBadRequest("failed to broadcast formation transaction: %v", err)
 	}
-	s.syncer.BroadcastV2TransactionSet(basis, formationSet)
 
 	// add the contract to the contractor
 	err = s.contractor.AddV2Contract(TransactionSet{
@@ -658,6 +650,9 @@ func (s *Server) handleRPCFormContract(stream net.Conn) error {
 	if err != nil {
 		return fmt.Errorf("failed to add contract: %w", err)
 	}
+	// broadcast the finalized contract formation set
+	broadcast = true // set broadcast so the UTXOs will not be released if the renter happens to disconnect before receiving the last response
+	s.syncer.BroadcastV2TransactionSet(basis, formationSet)
 
 	// send the finalized transaction set to the renter
 	return rhp4.WriteResponse(stream, &rhp4.RPCFormContractThirdResponse{
@@ -693,7 +688,7 @@ func (s *Server) handleRPCRefreshContract(stream net.Conn) error {
 
 	// validate the request
 	settings := s.settings.RHP4Settings()
-	if err := req.Validate(s.hostKey.PublicKey(), state.Revision.ExpirationHeight, settings.MaxCollateral); err != nil {
+	if err := req.Validate(s.hostKey.PublicKey(), state.Revision.TotalCollateral, state.Revision.ExpirationHeight, settings.MaxCollateral); err != nil {
 		return rhp4.NewRPCError(rhp4.ErrorCodeBadRequest, err.Error())
 	}
 
@@ -728,17 +723,25 @@ func (s *Server) handleRPCRefreshContract(stream net.Conn) error {
 		return fmt.Errorf("failed to get contract element: %w", err)
 	}
 
+	var broadcast bool
 	basis, toSign, err := s.wallet.FundV2Transaction(&renewalTxn, hostCost, true)
 	if errors.Is(err, wallet.ErrNotEnoughFunds) {
 		return rhp4.ErrHostFundError
 	} else if err != nil {
 		return fmt.Errorf("failed to fund transaction: %w", err)
 	}
+	defer func() {
+		if broadcast {
+			return
+		}
+		// release the locked UTXOs if the transaction is not going to be broadcast
+		s.wallet.ReleaseInputs(nil, []types.V2Transaction{renewalTxn})
+	}()
 
 	// update renter inputs to reflect our chain state
 	if basis != req.Basis {
-		hostInputs := renewalTxn.SiacoinInputs[len(renewalTxn.SiacoinInputs)-len(req.RenterInputs):]
-		renewalTxn.SiacoinInputs = renewalTxn.SiacoinInputs[:len(renewalTxn.SiacoinInputs)-len(req.RenterInputs)]
+		hostInputs := renewalTxn.SiacoinInputs[len(req.RenterInputs):]
+		renewalTxn.SiacoinInputs = renewalTxn.SiacoinInputs[:len(req.RenterInputs)]
 		updated, err := s.chain.UpdateV2TransactionSet([]types.V2Transaction{renewalTxn}, req.Basis, basis)
 		if err != nil {
 			return errorBadRequest("failed to update renter inputs from %q to %q: %v", req.Basis, basis, err)
@@ -782,15 +785,22 @@ func (s *Server) handleRPCRefreshContract(stream net.Conn) error {
 	// validate the renter's signature
 	renewalSigHash := cs.RenewalSigHash(renewal)
 	if !existing.RenterPublicKey.VerifyHash(renewalSigHash, renterSigResp.RenterRenewalSignature) {
-		return rhp4.ErrInvalidSignature
+		return fmt.Errorf("failed to validate renter renewal signature: %w", rhp4.ErrInvalidSignature)
 	}
 	renewal.RenterSignature = renterSigResp.RenterRenewalSignature
+	renewal.HostSignature = s.hostKey.SignHash(renewalSigHash)
+
+	contractSigHash := cs.ContractSigHash(renewal.NewContract)
+	if !existing.RenterPublicKey.VerifyHash(contractSigHash, renterSigResp.RenterContractSignature) {
+		return fmt.Errorf("failed to validate renter contract signature: %w", rhp4.ErrInvalidSignature)
+	}
+	renewal.NewContract.RenterSignature = renterSigResp.RenterContractSignature
+	renewal.NewContract.HostSignature = s.hostKey.SignHash(contractSigHash)
 
 	// apply the renter's signatures
 	for i, policy := range renterSigResp.RenterSatisfiedPolicies {
 		renewalTxn.SiacoinInputs[i].SatisfiedPolicy = policy
 	}
-	renewal.HostSignature = s.hostKey.SignHash(renewalSigHash)
 
 	// add the renter's parents to our transaction pool to ensure they are valid
 	// and update the proofs.
@@ -807,8 +817,6 @@ func (s *Server) handleRPCRefreshContract(stream net.Conn) error {
 	} else if _, err = s.chain.AddV2PoolTransactions(basis, renewalSet); err != nil {
 		return errorBadRequest("failed to broadcast renewal set: %v", err)
 	}
-	// broadcast the transaction set
-	s.syncer.BroadcastV2TransactionSet(basis, renewalSet)
 
 	// add the contract to the contractor
 	err = s.contractor.RenewV2Contract(TransactionSet{
@@ -818,6 +826,9 @@ func (s *Server) handleRPCRefreshContract(stream net.Conn) error {
 	if err != nil {
 		return fmt.Errorf("failed to add contract: %w", err)
 	}
+
+	broadcast = true // set broadcast so the UTXOs will not be released if the renter happens to disconnect before receiving the last response
+	s.syncer.BroadcastV2TransactionSet(basis, renewalSet)
 
 	// send the finalized transaction set to the renter
 	return rhp4.WriteResponse(stream, &rhp4.RPCRefreshContractThirdResponse{
@@ -849,7 +860,7 @@ func (s *Server) handleRPCRenewContract(stream net.Conn) error {
 	tip := s.chain.Tip()
 
 	// validate the request
-	if err := req.Validate(s.hostKey.PublicKey(), tip, state.Revision.ProofHeight, settings.MaxCollateral, settings.MaxContractDuration); err != nil {
+	if err := req.Validate(s.hostKey.PublicKey(), tip, state.Revision.Filesize, state.Revision.ProofHeight, settings.MaxCollateral, settings.MaxContractDuration); err != nil {
 		return rhp4.NewRPCError(rhp4.ErrorCodeBadRequest, err.Error())
 	}
 
@@ -890,17 +901,25 @@ func (s *Server) handleRPCRenewContract(stream net.Conn) error {
 		return fmt.Errorf("failed to get contract element: %w", err)
 	}
 
+	var broadcast bool
 	basis, toSign, err := s.wallet.FundV2Transaction(&renewalTxn, hostCost, true)
 	if errors.Is(err, wallet.ErrNotEnoughFunds) {
 		return rhp4.ErrHostFundError
 	} else if err != nil {
 		return fmt.Errorf("failed to fund transaction: %w", err)
 	}
+	defer func() {
+		if broadcast {
+			return
+		}
+		// release the locked UTXOs if the transaction is not going to be broadcast
+		s.wallet.ReleaseInputs(nil, []types.V2Transaction{renewalTxn})
+	}()
 
 	// update renter inputs to reflect our chain state
 	if basis != req.Basis {
-		hostInputs := renewalTxn.SiacoinInputs[len(renewalTxn.SiacoinInputs)-len(req.RenterInputs):]
-		renewalTxn.SiacoinInputs = renewalTxn.SiacoinInputs[:len(renewalTxn.SiacoinInputs)-len(req.RenterInputs)]
+		hostInputs := renewalTxn.SiacoinInputs[len(req.RenterInputs):]
+		renewalTxn.SiacoinInputs = renewalTxn.SiacoinInputs[:len(req.RenterInputs)]
 		updated, err := s.chain.UpdateV2TransactionSet([]types.V2Transaction{renewalTxn}, req.Basis, basis)
 		if err != nil {
 			return errorBadRequest("failed to update renter inputs from %q to %q: %v", req.Basis, basis, err)
@@ -944,15 +963,22 @@ func (s *Server) handleRPCRenewContract(stream net.Conn) error {
 	// validate the renter's signature
 	renewalSigHash := cs.RenewalSigHash(renewal)
 	if !existing.RenterPublicKey.VerifyHash(renewalSigHash, renterSigResp.RenterRenewalSignature) {
-		return rhp4.ErrInvalidSignature
+		return fmt.Errorf("failed to validate renewal signature: %w", rhp4.ErrInvalidSignature)
 	}
 	renewal.RenterSignature = renterSigResp.RenterRenewalSignature
+	renewal.HostSignature = s.hostKey.SignHash(renewalSigHash)
+
+	contractSighash := cs.ContractSigHash(renewal.NewContract)
+	if !existing.RenterPublicKey.VerifyHash(contractSighash, renterSigResp.RenterContractSignature) {
+		return fmt.Errorf("failed to validate contract signature: %w", rhp4.ErrInvalidSignature)
+	}
+	renewal.NewContract.RenterSignature = renterSigResp.RenterContractSignature
+	renewal.NewContract.HostSignature = s.hostKey.SignHash(contractSighash)
 
 	// apply the renter's signatures
 	for i, policy := range renterSigResp.RenterSatisfiedPolicies {
 		renewalTxn.SiacoinInputs[i].SatisfiedPolicy = policy
 	}
-	renewal.HostSignature = s.hostKey.SignHash(renewalSigHash)
 
 	// add the renter's parents to our transaction pool to ensure they are valid
 	// and update the proofs.
@@ -969,8 +995,6 @@ func (s *Server) handleRPCRenewContract(stream net.Conn) error {
 	} else if _, err = s.chain.AddV2PoolTransactions(basis, renewalSet); err != nil {
 		return errorBadRequest("failed to broadcast renewal set: %v", err)
 	}
-	// broadcast the transaction set
-	s.syncer.BroadcastV2TransactionSet(basis, renewalSet)
 
 	// add the contract to the contractor
 	err = s.contractor.RenewV2Contract(TransactionSet{
@@ -980,6 +1004,9 @@ func (s *Server) handleRPCRenewContract(stream net.Conn) error {
 	if err != nil {
 		return fmt.Errorf("failed to add contract: %w", err)
 	}
+
+	broadcast = true // set broadcast so the UTXOs will not be released if the renter happens to disconnect before receiving the last response
+	s.syncer.BroadcastV2TransactionSet(basis, renewalSet)
 
 	// send the finalized transaction set to the renter
 	return rhp4.WriteResponse(stream, &rhp4.RPCRenewContractThirdResponse{
@@ -1119,9 +1146,8 @@ func errorDecodingError(f string, p ...any) error {
 // NewServer creates a new RHP4 server
 func NewServer(pk types.PrivateKey, cm ChainManager, syncer Syncer, contracts Contractor, wallet Wallet, settings Settings, sectors Sectors, opts ...ServerOption) *Server {
 	s := &Server{
-		hostKey:                   pk,
-		priceTableValidity:        30 * time.Minute,
-		contractProofWindowBuffer: 10,
+		hostKey:            pk,
+		priceTableValidity: 30 * time.Minute,
 
 		chain:      cm,
 		syncer:     syncer,

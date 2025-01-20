@@ -45,6 +45,7 @@ type Store interface {
 
 	Block(id types.BlockID) (types.Block, *consensus.V1BlockSupplement, bool)
 	AddBlock(b types.Block, bs *consensus.V1BlockSupplement)
+	PruneBlock(id types.BlockID)
 	State(id types.BlockID) (consensus.State, bool)
 	AddState(cs consensus.State)
 	AncestorTimestamp(id types.BlockID) (time.Time, bool)
@@ -74,11 +75,14 @@ func blockAndChild(s Store, id types.BlockID) (types.Block, *consensus.V1BlockSu
 // A Manager tracks multiple blockchains and identifies the best valid
 // chain.
 type Manager struct {
-	log           *zap.Logger
 	store         Store
 	tipState      consensus.State
 	onReorg       map[[16]byte]func(types.ChainIndex)
 	invalidBlocks map[types.BlockID]error
+
+	// configuration options
+	log         *zap.Logger
+	pruneTarget uint64
 
 	txpool struct {
 		txns           []types.Transaction
@@ -314,6 +318,12 @@ func (m *Manager) applyTip(index types.ChainIndex) error {
 	m.store.ApplyBlock(cs, cau)
 	m.applyPoolUpdate(cau, cs)
 	m.tipState = cs
+
+	if m.pruneTarget != 0 && cs.Index.Height > m.pruneTarget {
+		if index, ok := m.store.BestIndex(cs.Index.Height - m.pruneTarget); ok {
+			m.store.PruneBlock(index.ID)
+		}
+	}
 	return nil
 }
 
@@ -816,7 +826,7 @@ func (m *Manager) V2PoolTransaction(id types.TransactionID) (types.V2Transaction
 	if !ok {
 		return types.V2Transaction{}, false
 	}
-	return m.txpool.v2txns[i], ok
+	return m.txpool.v2txns[i].DeepCopy(), ok
 }
 
 // V2PoolTransactions returns the v2 transactions currently in the txpool. Any
@@ -825,7 +835,11 @@ func (m *Manager) V2PoolTransactions() []types.V2Transaction {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.revalidatePool()
-	return append([]types.V2Transaction(nil), m.txpool.v2txns...)
+	v2txns := make([]types.V2Transaction, len(m.txpool.v2txns))
+	for i, txn := range m.txpool.v2txns {
+		v2txns[i] = txn.DeepCopy()
+	}
+	return v2txns
 }
 
 // TransactionsForPartialBlock returns the transactions in the txpool with the

@@ -1728,14 +1728,10 @@ func TestSingleAddressWalletEventTypes(t *testing.T) {
 			cau.UpdateElementProof(&fce.StateElement)
 		}
 
-		// finalize the contract
-		finalRevision := fce.V2FileContract
-		finalRevision.RevisionNumber = math.MaxUint64
-		finalRevision.RenterSignature = types.Signature{}
-		finalRevision.HostSignature = types.Signature{}
 		// create a renewal
 		renewal := types.V2FileContractRenewal{
-			FinalRevision: finalRevision,
+			FinalRenterOutput: fce.V2FileContract.RenterOutput,
+			FinalHostOutput:   fce.V2FileContract.HostOutput,
 			NewContract: types.V2FileContract{
 				RenterOutput:     fc.RenterOutput,
 				ProofHeight:      fc.ProofHeight + 10,
@@ -1750,6 +1746,10 @@ func TestSingleAddressWalletEventTypes(t *testing.T) {
 		renewalSig := pk.SignHash(renewalSigHash)
 		renewal.RenterSignature = renewalSig
 		renewal.HostSignature = renewalSig
+		contractSigHash := cm.TipState().ContractSigHash(renewal.NewContract)
+		contractSig := pk.SignHash(contractSigHash)
+		renewal.NewContract.RenterSignature = contractSig
+		renewal.NewContract.HostSignature = contractSig
 
 		newContractValue := renterPayout.Add(cm.TipState().V2FileContractTax(renewal.NewContract))
 
@@ -1946,10 +1946,11 @@ func TestV2TxPoolRace(t *testing.T) {
 	// output in the spend transaction invalid unless it is updated.
 	mineAndSync(t, cm, ws, w, types.VoidAddress, 1)
 
-	// now that the setup transaction has been accepted, we can't include it in
-	// the set anymore, or we'll get a double-spend error. AddV2PoolTransactions
-	// will internally replace the ephemeral output, making spendTxn valid.
-	if _, err := cm.AddV2PoolTransactions(basis, []types.V2Transaction{spendTxn}); err != nil {
+	// even though the setup transaction has been confirmed, and the spend
+	// transaction is outdated, we can still add them without error: internally,
+	// AddV2PoolTransactions will remove any confirmed transactions, replace any
+	// ephemeral outputs, and update the Merkle proofs of all elements.
+	if _, err := cm.AddV2PoolTransactions(basis, []types.V2Transaction{setupTxn, spendTxn}); err != nil {
 		t.Fatal(err)
 	}
 	// updating the transaction shouldn't change its ID
