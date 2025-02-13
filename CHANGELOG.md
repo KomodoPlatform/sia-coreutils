@@ -1,3 +1,28 @@
+## 0.11.1 (2025-02-10)
+
+### Fixes
+
+- Fixes an issue where redistribution of wallet outputs that require more than a single transaction would produce an invalid transaction set
+
+## 0.11.0 (2025-02-06)
+
+### Breaking Changes
+
+- Add support for QUIC and WebTransport to RHP4
+
+### Fixes
+
+- Fixed data race in EphemeralContractor related to V2FileContractElement.
+- Fixed syncer deadlocking when Connect is called after Close.
+- Set 2 minute deadline for all incoming RPC in syncer
+
+## 0.10.1 (2025-01-18)
+
+### Fixes
+
+- Update core to v0.9.1
+- Use condition rather than polling to determine whether all peers are closed in 'Run'
+
 ## 0.10.0 (2025-01-15)
 
 ### Breaking Changes

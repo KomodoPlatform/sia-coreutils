@@ -12,6 +12,7 @@ import (
 	"go.sia.tech/core/consensus"
 	"go.sia.tech/core/gateway"
 	"go.sia.tech/core/types"
+	"go.sia.tech/coreutils/threadgroup"
 	"go.uber.org/zap"
 	"lukechampine.com/frand"
 )
@@ -83,6 +84,7 @@ type config struct {
 	MaxInboundPeers            int
 	MaxOutboundPeers           int
 	MaxInflightRPCs            int
+	RPCTimeout                 time.Duration
 	ConnectTimeout             time.Duration
 	ShareNodesTimeout          time.Duration
 	SendBlockTimeout           time.Duration
@@ -123,6 +125,11 @@ func WithMaxInflightRPCs(n int) Option {
 // 5 seconds.
 func WithConnectTimeout(d time.Duration) Option {
 	return func(c *config) { c.ConnectTimeout = d }
+}
+
+// WithRPCTimeout sets the timeout for all incoming RPCs. The default is 2 minutes.
+func WithRPCTimeout(d time.Duration) Option {
+	return func(c *config) { c.RPCTimeout = d }
 }
 
 // WithShareNodesTimeout sets the timeout for the ShareNodes RPC. The default is
@@ -206,11 +213,12 @@ type Syncer struct {
 	config config
 	log    *zap.Logger // redundant, but convenient
 
-	wg sync.WaitGroup
+	tg *threadgroup.ThreadGroup
 
-	mu      sync.Mutex
-	peers   map[string]*Peer
-	strikes map[string]int
+	mu          sync.Mutex
+	peerRemoved sync.Cond // broadcasts when peer is removed from 'peers'
+	peers       map[string]*Peer
+	strikes     map[string]int
 }
 
 func (s *Syncer) resync(p *Peer, reason string) {
@@ -256,6 +264,17 @@ func (s *Syncer) ban(p *Peer, err error) error {
 }
 
 func (s *Syncer) runPeer(p *Peer) error {
+	// always try and remove the peer from the map when we're done, cause it
+	// might already have been added by Connect()
+	defer func() {
+		s.mu.Lock()
+		delete(s.peers, p.t.Addr)
+		s.mu.Unlock()
+
+		// notify goroutines of removed peer
+		s.peerRemoved.Broadcast()
+	}()
+
 	if err := s.pm.AddPeer(p.t.Addr); err != nil {
 		return fmt.Errorf("failed to add peer: %w", err)
 	}
@@ -268,11 +287,6 @@ func (s *Syncer) runPeer(p *Peer) error {
 	s.mu.Lock()
 	s.peers[p.t.Addr] = p
 	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		delete(s.peers, p.t.Addr)
-		s.mu.Unlock()
-	}()
 
 	inflight := make(chan struct{}, s.config.MaxInflightRPCs)
 
@@ -285,18 +299,26 @@ func (s *Syncer) runPeer(p *Peer) error {
 			p.setErr(err)
 			return fmt.Errorf("failed to accept rpc: %w", err)
 		}
-		inflight <- struct{}{}
-		s.wg.Add(1)
+		select {
+		case inflight <- struct{}{}:
+		case <-s.tg.Done():
+			return threadgroup.ErrClosed
+		}
+
 		go func() {
-			defer s.wg.Done()
+			defer func() { <-inflight }()
+
+			done, err := s.tg.Add()
+			if err != nil {
+				return
+			}
+			defer done()
 			defer stream.Close()
-			// NOTE: we do not set any deadlines on the stream. If a peer is
-			// slow, fine; we don't need to worry about resource exhaustion
-			// unless we have tons of peers.
-			if err := s.handleRPC(id, stream, p); err != nil {
+			if err := stream.SetDeadline(time.Now().Add(s.config.RPCTimeout)); err != nil {
+				s.log.Debug("failed to set rpc deadline", zap.Error(err))
+			} else if err := s.handleRPC(id, stream, p); err != nil {
 				s.log.Debug("rpc failed", zap.Stringer("peer", p), zap.Stringer("rpc", id), zap.Error(err))
 			}
-			<-inflight
 		}()
 	}
 }
@@ -359,9 +381,12 @@ func (s *Syncer) relayV2TransactionSet(index types.ChainIndex, txns []types.V2Tr
 func (s *Syncer) allowConnect(ctx context.Context, peer string, inbound bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.l == nil {
-		return errors.New("syncer is shutting down")
+
+	done, err := s.tg.Add()
+	if err != nil {
+		return err
 	}
+	defer done()
 
 	var addrs []net.IPAddr
 	if peerHost, _, err := net.SplitHostPort(peer); err != nil {
@@ -407,10 +432,16 @@ func (s *Syncer) alreadyConnected(id gateway.UniqueID) bool {
 }
 
 func (s *Syncer) acceptLoop(ctx context.Context) error {
+	ctx, done, err := s.tg.AddContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
+
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return threadgroup.ErrClosed
 		default:
 		}
 
@@ -418,9 +449,13 @@ func (s *Syncer) acceptLoop(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		s.wg.Add(1)
+
 		go func() {
-			defer s.wg.Done()
+			done, err := s.tg.Add()
+			if err != nil {
+				return
+			}
+			defer done()
 			defer conn.Close()
 			if err := s.allowConnect(ctx, conn.RemoteAddr().String(), true); err != nil {
 				s.log.Debug("rejected inbound connection", zap.Stringer("remoteAddress", conn.RemoteAddr()), zap.Error(err))
@@ -641,17 +676,26 @@ func (s *Syncer) syncLoop(ctx context.Context) error {
 // connections, and syncing the blockchain from active peers. It blocks until an
 // error occurs, upon which all connections are closed and goroutines are
 // terminated.
-func (s *Syncer) Run(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	s.wg.Add(1)
-	defer s.wg.Done()
+func (s *Syncer) Run() error {
+	ctx, done, err := s.tg.AddContext(context.Background())
+	if err != nil {
+		return err
+	}
+	defer done()
+
 	errChan := make(chan error)
-	s.wg.Add(3)
-	go func() { errChan <- s.acceptLoop(ctx); s.wg.Done() }()
-	go func() { errChan <- s.peerLoop(ctx); s.wg.Done() }()
-	go func() { errChan <- s.syncLoop(ctx); s.wg.Done() }()
-	err := <-errChan
-	cancel()
+	for _, fn := range []func(context.Context) error{s.acceptLoop, s.peerLoop, s.syncLoop} {
+		go func() {
+			done, err := s.tg.Add()
+			if err != nil {
+				errChan <- err
+				return
+			}
+			errChan <- fn(ctx)
+			done()
+		}()
+	}
+	err = <-errChan
 
 	// when one goroutine exits, shutdown and wait for the others
 	s.l.Close()
@@ -664,12 +708,9 @@ func (s *Syncer) Run(ctx context.Context) error {
 	<-errChan
 
 	// wait for all peer goroutines to exit
-	// TODO: a cond would be nicer than polling here
 	s.mu.Lock()
 	for len(s.peers) != 0 {
-		s.mu.Unlock()
-		time.Sleep(100 * time.Millisecond)
-		s.mu.Lock()
+		s.peerRemoved.Wait()
 	}
 	s.mu.Unlock()
 
@@ -682,12 +723,18 @@ func (s *Syncer) Run(ctx context.Context) error {
 // Close closes the Syncer's net.Listener.
 func (s *Syncer) Close() error {
 	err := s.l.Close()
-	s.wg.Wait()
+	s.tg.Stop()
 	return err
 }
 
 // Connect forms an outbound connection to a peer.
 func (s *Syncer) Connect(ctx context.Context, addr string) (*Peer, error) {
+	ctx, done, err := s.tg.AddContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
@@ -707,10 +754,13 @@ func (s *Syncer) Connect(ctx context.Context, addr string) (*Peer, error) {
 		ConnAddr: conn.RemoteAddr().String(),
 		Inbound:  false,
 	}
-	s.wg.Add(1)
 	go func() {
-		defer s.wg.Done()
+		done, err := s.tg.Add()
+		if err != nil {
+			return
+		}
 		s.runPeer(p)
+		done()
 	}()
 
 	// runPeer does this too, but doing it outside the goroutine prevents a race
@@ -770,6 +820,7 @@ func New(l net.Listener, cm ChainManager, pm PeerStore, header gateway.Header, o
 		MaxOutboundPeers:           16,
 		MaxInflightRPCs:            3,
 		ConnectTimeout:             5 * time.Second,
+		RPCTimeout:                 2 * time.Minute,
 		ShareNodesTimeout:          5 * time.Second,
 		SendBlockTimeout:           60 * time.Second,
 		SendTransactionsTimeout:    60 * time.Second,
@@ -786,7 +837,7 @@ func New(l net.Listener, cm ChainManager, pm PeerStore, header gateway.Header, o
 	for _, opt := range opts {
 		opt(&config)
 	}
-	return &Syncer{
+	s := &Syncer{
 		l:       l,
 		cm:      cm,
 		pm:      pm,
@@ -795,5 +846,8 @@ func New(l net.Listener, cm ChainManager, pm PeerStore, header gateway.Header, o
 		log:     config.Logger,
 		peers:   make(map[string]*Peer),
 		strikes: make(map[string]int),
+		tg:      threadgroup.New(),
 	}
+	s.peerRemoved = sync.Cond{L: &s.mu}
+	return s
 }

@@ -501,7 +501,7 @@ func TestWalletRedistribute(t *testing.T) {
 		}
 
 		for i := 0; i < len(txns); i++ {
-			w.SignTransaction(&txns[i], toSign, types.CoveredFields{WholeTransaction: true})
+			w.SignTransaction(&txns[i], toSign[i], types.CoveredFields{WholeTransaction: true})
 		}
 		if _, err := cm.AddPoolTransactions(txns); err != nil {
 			return fmt.Errorf("failed to add transactions to pool: %w", err)
@@ -557,6 +557,17 @@ func TestWalletRedistribute(t *testing.T) {
 		t.Fatalf("expected no transactions, got %v", len(txns))
 	} else if len(toSign) != 0 {
 		t.Fatalf("expected no ids, got %v", len(toSign))
+	}
+
+	// redistribute the wallet into more outputs than the batch size to make
+	// sure the resulting txn set contains more than 1 txn
+	outputs, err := w.SpendableOutputs()
+	if err != nil {
+		t.Fatal(err)
+	} else if len(outputs) >= 11 {
+		t.Fatalf("expected at least 11 outputs, got %v", len(outputs))
+	} else if err := redistribute(types.Siacoins(1e3), 11); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -652,6 +663,17 @@ func TestWalletRedistributeV2(t *testing.T) {
 		t.Fatalf("expected no transactions, got %v", len(txns))
 	} else if len(toSign) != 0 {
 		t.Fatalf("expected no ids, got %v", len(toSign))
+	}
+
+	// redistribute the wallet into more outputs than the batch size to make
+	// sure the resulting txn set contains more than 1 txn
+	outputs, err := w.SpendableOutputs()
+	if err != nil {
+		t.Fatal(err)
+	} else if len(outputs) >= 11 {
+		t.Fatalf("expected at least 11 outputs, got %v", len(outputs))
+	} else if err := redistribute(types.Siacoins(1e3), 11); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1561,11 +1583,8 @@ func TestSingleAddressWalletEventTypes(t *testing.T) {
 		}
 
 		// get the confirmed file contract element
-		var fce types.V2FileContractElement
-		applied[0].ForEachV2FileContractElement(func(ele types.V2FileContractElement, _ bool, _ *types.V2FileContractElement, _ types.V2FileContractResolutionType) {
-			fce = ele
-		})
-		for _, cau := range applied {
+		fce := applied[0].V2FileContractElementDiffs()[0].V2FileContractElement
+		for _, cau := range applied[1:] {
 			cau.UpdateElementProof(&fce.StateElement)
 		}
 
@@ -1637,12 +1656,8 @@ func TestSingleAddressWalletEventTypes(t *testing.T) {
 		}
 
 		// get the confirmed file contract element
-		var fce types.V2FileContractElement
-		applied[0].ForEachV2FileContractElement(func(ele types.V2FileContractElement, _ bool, _ *types.V2FileContractElement, _ types.V2FileContractResolutionType) {
-			fce = ele
-		})
-		// update its proof
-		for _, cau := range applied {
+		fce := applied[0].V2FileContractElementDiffs()[0].V2FileContractElement
+		for _, cau := range applied[1:] {
 			cau.UpdateElementProof(&fce.StateElement)
 		}
 		// get the proof index element
@@ -1720,11 +1735,8 @@ func TestSingleAddressWalletEventTypes(t *testing.T) {
 		}
 
 		// get the confirmed file contract element
-		var fce types.V2FileContractElement
-		applied[0].ForEachV2FileContractElement(func(ele types.V2FileContractElement, _ bool, _ *types.V2FileContractElement, _ types.V2FileContractResolutionType) {
-			fce = ele
-		})
-		for _, cau := range applied {
+		fce := applied[0].V2FileContractElementDiffs()[0].V2FileContractElement
+		for _, cau := range applied[1:] {
 			cau.UpdateElementProof(&fce.StateElement)
 		}
 

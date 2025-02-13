@@ -1,19 +1,25 @@
 package testutil
 
 import (
-	"crypto/ed25519"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"net"
 	"sync"
 	"testing"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"go.sia.tech/core/consensus"
 	proto4 "go.sia.tech/core/rhp/v4"
 	"go.sia.tech/core/types"
 	"go.sia.tech/coreutils/chain"
 	rhp4 "go.sia.tech/coreutils/rhp/v4"
-	"go.sia.tech/mux/v2"
 	"go.uber.org/zap"
+	"lukechampine.com/frand"
 )
 
 // An EphemeralSectorStore is an in-memory minimal rhp4.SectorStore for testing.
@@ -61,10 +67,17 @@ type EphemeralContractor struct {
 
 	accounts map[proto4.Account]types.Currency
 
-	mu sync.Mutex
+	mu       sync.Mutex
+	shutdown chan struct{}
 }
 
 var _ rhp4.Contractor = (*EphemeralContractor)(nil)
+
+// Close closes the contractor by interrupting its background loop
+func (ec *EphemeralContractor) Close() error {
+	close(ec.shutdown)
+	return nil
+}
 
 // V2FileContractElement returns the contract state element for the given contract ID.
 func (ec *EphemeralContractor) V2FileContractElement(contractID types.FileContractID) (types.ChainIndex, types.V2FileContractElement, error) {
@@ -75,6 +88,10 @@ func (ec *EphemeralContractor) V2FileContractElement(contractID types.FileContra
 	if !ok {
 		return types.ChainIndex{}, types.V2FileContractElement{}, errors.New("contract not found")
 	}
+
+	// deep-copy element's proof to avoid passing a reference to the
+	// EphemeralContractor's internal state
+	element.StateElement.MerkleProof = append([]types.Hash256(nil), element.StateElement.MerkleProof...)
 	return ec.tip, element, nil
 }
 
@@ -266,20 +283,20 @@ func (ec *EphemeralContractor) UpdateChainState(reverted []chain.RevertUpdate, a
 	defer ec.mu.Unlock()
 
 	for _, cru := range reverted {
-		cru.ForEachV2FileContractElement(func(fce types.V2FileContractElement, created bool, rev *types.V2FileContractElement, res types.V2FileContractResolutionType) {
-			if _, ok := ec.contracts[types.FileContractID(fce.ID)]; !ok {
-				return
+		for _, fced := range cru.V2FileContractElementDiffs() {
+			if _, ok := ec.contracts[fced.V2FileContractElement.ID]; !ok {
+				continue
 			}
-
 			switch {
-			case created:
-				delete(ec.contractElements, types.FileContractID(fce.ID))
-			case res != nil:
-				ec.contractElements[types.FileContractID(fce.ID)] = fce
-			case rev != nil:
-				ec.contractElements[types.FileContractID(fce.ID)] = *rev
+			case fced.Created:
+				delete(ec.contractElements, fced.V2FileContractElement.ID)
+			case fced.Resolution != nil:
+				ec.contractElements[fced.V2FileContractElement.ID] = fced.V2FileContractElement
+			case fced.Revision != nil:
+				fced.V2FileContractElement.V2FileContract = *fced.Revision
+				ec.contractElements[fced.V2FileContractElement.ID] = fced.V2FileContractElement
 			}
-		})
+		}
 
 		for id, fce := range ec.contractElements {
 			cru.UpdateElementProof(&fce.StateElement)
@@ -288,20 +305,20 @@ func (ec *EphemeralContractor) UpdateChainState(reverted []chain.RevertUpdate, a
 		ec.tip = cru.State.Index
 	}
 	for _, cau := range applied {
-		cau.ForEachV2FileContractElement(func(fce types.V2FileContractElement, created bool, rev *types.V2FileContractElement, res types.V2FileContractResolutionType) {
-			if _, ok := ec.contracts[types.FileContractID(fce.ID)]; !ok {
-				return
+		for _, fced := range cau.V2FileContractElementDiffs() {
+			if _, ok := ec.contracts[fced.V2FileContractElement.ID]; !ok {
+				continue
 			}
-
 			switch {
-			case created:
-				ec.contractElements[types.FileContractID(fce.ID)] = fce
-			case res != nil:
-				delete(ec.contractElements, types.FileContractID(fce.ID))
-			case rev != nil:
-				ec.contractElements[types.FileContractID(fce.ID)] = *rev
+			case fced.Created:
+				ec.contractElements[fced.V2FileContractElement.ID] = fced.V2FileContractElement
+			case fced.Resolution != nil:
+				delete(ec.contractElements, fced.V2FileContractElement.ID)
+			case fced.Revision != nil:
+				fced.V2FileContractElement.V2FileContract = *fced.Revision
+				ec.contractElements[fced.V2FileContractElement.ID] = fced.V2FileContractElement
 			}
-		})
+		}
 
 		for id, fce := range ec.contractElements {
 			cau.UpdateElementProof(&fce.StateElement)
@@ -342,21 +359,6 @@ func (esr *EphemeralSettingsReporter) Update(settings proto4.HostSettings) {
 	esr.settings = settings
 }
 
-// A muxTransport is a rhp4.Transport that wraps a mux.Mux.
-type muxTransport struct {
-	m *mux.Mux
-}
-
-// Close implements the rhp4.Transport interface.
-func (mt *muxTransport) Close() error {
-	return mt.m.Close()
-}
-
-// AcceptStream implements the rhp4.Transport interface.
-func (mt *muxTransport) AcceptStream() (net.Conn, error) {
-	return mt.m.AcceptStream()
-}
-
 // ServeSiaMux starts a RHP4 host listening on a random port and returns the address.
 func ServeSiaMux(tb testing.TB, s *rhp4.Server, log *zap.Logger) string {
 	l, err := net.Listen("tcp", "localhost:0")
@@ -365,25 +367,44 @@ func ServeSiaMux(tb testing.TB, s *rhp4.Server, log *zap.Logger) string {
 	}
 	tb.Cleanup(func() { l.Close() })
 
-	go func() {
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				return
-			}
-			log := log.With(zap.Stringer("peerAddress", conn.RemoteAddr()))
-
-			go func() {
-				defer conn.Close()
-				m, err := mux.Accept(conn, ed25519.PrivateKey(s.HostKey()))
-				if err != nil {
-					panic(err)
-				}
-				s.Serve(&muxTransport{m}, log)
-			}()
-		}
-	}()
+	go rhp4.ServeSiaMux(l, s, log)
 	return l.Addr().String()
+}
+
+// ServeQUIC starts a RHP4 host listening on a random port and returns the address.
+func ServeQUIC(tb testing.TB, s *rhp4.Server, log *zap.Logger) string {
+	key, err := rsa.GenerateKey(frand.Reader, 2048)
+	if err != nil {
+		tb.Fatal("failed to generate key:", err)
+	}
+	template := x509.Certificate{SerialNumber: big.NewInt(1)}
+	certDER, err := x509.CreateCertificate(frand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		tb.Fatal("failed to create certificate:", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		tb.Fatal("failed to create tls key pair:", err)
+	}
+
+	l, err := quic.ListenAddr("[::]:4848", &tls.Config{
+		Certificates:       []tls.Certificate{tlsCert},
+		NextProtos:         []string{http3.NextProtoH3, rhp4.TLSNextProtoRHP4},
+		InsecureSkipVerify: true,
+	},
+		&quic.Config{
+			EnableDatagrams: true,
+		})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() { l.Close() })
+
+	go rhp4.ServeQUIC(l, s, log)
+	return "localhost:4848"
 }
 
 // NewEphemeralSettingsReporter creates an EphemeralSettingsReporter for testing.
@@ -406,6 +427,7 @@ func NewEphemeralContractor(cm *chain.Manager) *EphemeralContractor {
 		roots:            make(map[types.FileContractID][]types.Hash256),
 		locks:            make(map[types.FileContractID]bool),
 		accounts:         make(map[proto4.Account]types.Currency),
+		shutdown:         make(chan struct{}),
 	}
 
 	reorgCh := make(chan types.ChainIndex, 1)
@@ -417,7 +439,12 @@ func NewEphemeralContractor(cm *chain.Manager) *EphemeralContractor {
 	})
 
 	go func() {
-		for range reorgCh {
+		for {
+			select {
+			case <-reorgCh:
+			case <-ec.shutdown:
+				return
+			}
 			for {
 				reverted, applied, err := cm.UpdatesSince(ec.tip, 1000)
 				if err != nil {
