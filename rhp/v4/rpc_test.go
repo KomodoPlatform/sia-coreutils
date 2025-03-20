@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"math"
 	"net"
 	"reflect"
 	"strings"
@@ -17,12 +18,28 @@ import (
 	"go.sia.tech/core/types"
 	"go.sia.tech/coreutils/chain"
 	rhp4 "go.sia.tech/coreutils/rhp/v4"
+	"go.sia.tech/coreutils/rhp/v4/quic"
+	"go.sia.tech/coreutils/rhp/v4/siamux"
 	"go.sia.tech/coreutils/syncer"
 	"go.sia.tech/coreutils/testutil"
 	"go.sia.tech/coreutils/wallet"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
 	"lukechampine.com/frand"
 )
+
+type blockingSettingsReporter struct {
+	blockChan chan struct{}
+}
+
+func (b *blockingSettingsReporter) RHP4Settings() proto4.HostSettings {
+	<-b.blockChan
+	return proto4.HostSettings{}
+}
+
+func (b *blockingSettingsReporter) Unblock() {
+	close(b.blockChan)
+}
 
 type fundAndSign struct {
 	w  *wallet.SingleAddressWallet
@@ -53,7 +70,7 @@ func testRenterHostPairSiaMux(tb testing.TB, hostKey types.PrivateKey, cm rhp4.C
 	rs := rhp4.NewServer(hostKey, cm, s, c, w, sr, ss, rhp4.WithPriceTableValidity(2*time.Minute))
 	hostAddr := testutil.ServeSiaMux(tb, rs, log.Named("siamux"))
 
-	transport, err := rhp4.DialSiaMux(context.Background(), hostAddr, hostKey.PublicKey())
+	transport, err := siamux.Dial(context.Background(), hostAddr, hostKey.PublicKey())
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -66,7 +83,7 @@ func testRenterHostPairQUIC(tb testing.TB, hostKey types.PrivateKey, cm rhp4.Cha
 	rs := rhp4.NewServer(hostKey, cm, s, c, w, sr, ss, rhp4.WithPriceTableValidity(2*time.Minute))
 	hostAddr := testutil.ServeQUIC(tb, rs, log.Named("quic"))
 
-	transport, err := rhp4.DialQUIC(context.Background(), hostAddr, hostKey.PublicKey(), rhp4.WithTLSConfig(func(tc *tls.Config) {
+	transport, err := quic.Dial(context.Background(), hostAddr, hostKey.PublicKey(), quic.WithTLSConfig(func(tc *tls.Config) {
 		tc.InsecureSkipVerify = true
 	}))
 	if err != nil {
@@ -123,7 +140,7 @@ func startTestNode(tb testing.TB, n *consensus.Network, genesis types.Block) (*c
 		}
 	}()
 
-	stop := cm.OnReorg(func(index types.ChainIndex) {
+	stop := cm.OnReorg(func(_ types.ChainIndex) {
 		select {
 		case reorgCh <- struct{}{}:
 		default:
@@ -152,6 +169,26 @@ func mineAndSync(tb testing.TB, cm *chain.Manager, addr types.Address, n int, ti
 		if equals {
 			return
 		}
+	}
+}
+
+func assertValidRevision(t *testing.T, cm rhp4.ChainManager, c rhp4.Contractor, revision rhp4.ContractRevision) {
+	t.Helper()
+
+	basis, fce, err := c.V2FileContractElement(revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisionTxn := types.V2Transaction{
+		FileContractRevisions: []types.V2FileContractRevision{
+			{
+				Parent:   fce,
+				Revision: revision.Revision,
+			},
+		},
+	}
+	if _, err := cm.AddV2PoolTransactions(basis, []types.V2Transaction{revisionTxn}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -765,6 +802,274 @@ func TestRPCRenew(t *testing.T) {
 	})
 }
 
+func TestRPCTimeout(t *testing.T) {
+	n, genesis := testutil.V2Network()
+	cm, s, w := startTestNode(t, n, genesis)
+
+	ss := testutil.NewEphemeralSectorStore()
+	c := testutil.NewEphemeralContractor(cm)
+
+	isTimeoutErr := func(err error) bool {
+		t.Helper()
+		return err != nil && (strings.Contains(err.Error(), "deadline exceeded") || strings.Contains(err.Error(), "i/o timeout"))
+	}
+
+	assertRPCTimeout := func(transport rhp4.TransportClient, timeout bool) {
+		t.Helper()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		_, err := rhp4.RPCSettings(ctx, transport)
+		if timeout && !isTimeoutErr(err) {
+			t.Fatal("expected timeout", err)
+		} else if !timeout && err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("siamux", func(t *testing.T) {
+		sr := &blockingSettingsReporter{blockChan: make(chan struct{})}
+		transport := testRenterHostPairSiaMux(t, types.GeneratePrivateKey(), cm, s, w, c, sr, ss, zap.NewNop())
+		assertRPCTimeout(transport, true)
+		sr.Unblock()
+		assertRPCTimeout(transport, false)
+	})
+
+	t.Run("quic", func(t *testing.T) {
+		sr := &blockingSettingsReporter{blockChan: make(chan struct{})}
+		transport := testRenterHostPairQUIC(t, types.GeneratePrivateKey(), cm, s, w, c, sr, ss, zap.NewNop())
+		assertRPCTimeout(transport, true)
+		sr.Unblock()
+		assertRPCTimeout(transport, false)
+	})
+}
+
+func TestSiamuxDialUpgradeTimeout(t *testing.T) {
+	n, genesis := testutil.V2Network()
+	cm, s, w := startTestNode(t, n, genesis)
+
+	ss := testutil.NewEphemeralSectorStore()
+	c := testutil.NewEphemeralContractor(cm)
+
+	isTimeoutErr := func(err error) bool {
+		t.Helper()
+		return err != nil && (strings.Contains(err.Error(), "use of closed network connection") || strings.Contains(err.Error(), "operation was canceled"))
+	}
+
+	sr := testutil.NewEphemeralSettingsReporter()
+	hk := types.GeneratePrivateKey()
+	rs := rhp4.NewServer(hk, cm, s, c, w, sr, ss, rhp4.WithPriceTableValidity(2*time.Minute))
+	hostAddr := testutil.ServeSiaMux(t, rs, zap.NewNop())
+
+	t.Run("dial", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := siamux.Dial(ctx, hostAddr, hk.PublicKey())
+		if !isTimeoutErr(err) {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("upgrade", func(t *testing.T) {
+		conn, err := net.Dial("tcp", hostAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err = siamux.Upgrade(ctx, conn, hk.PublicKey())
+		if !isTimeoutErr(err) {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestReplenishAccounts(t *testing.T) {
+	n, genesis := testutil.V2Network()
+	hostKey, renterKey := types.GeneratePrivateKey(), types.GeneratePrivateKey()
+
+	cm, s, w := startTestNode(t, n, genesis)
+
+	// fund the wallet
+	mineAndSync(t, cm, w.Address(), int(n.MaturityDelay+20), w)
+
+	sr := testutil.NewEphemeralSettingsReporter()
+	sr.Update(proto4.HostSettings{
+		Release:             "test",
+		AcceptingContracts:  true,
+		WalletAddress:       w.Address(),
+		MaxCollateral:       types.Siacoins(10000),
+		MaxContractDuration: 1000,
+		RemainingStorage:    100 * proto4.SectorSize,
+		TotalStorage:        100 * proto4.SectorSize,
+		Prices: proto4.HostPrices{
+			ContractPrice: types.Siacoins(1).Div64(5), // 0.2 SC
+			StoragePrice:  types.NewCurrency64(100),   // 100 H / byte / block
+			IngressPrice:  types.NewCurrency64(100),   // 100 H / byte
+			EgressPrice:   types.NewCurrency64(100),   // 100 H / byte
+			Collateral:    types.NewCurrency64(200),
+		},
+	})
+	ss := testutil.NewEphemeralSectorStore()
+	c := testutil.NewEphemeralContractor(cm)
+
+	transport := testRenterHostPairSiaMux(t, hostKey, cm, s, w, c, sr, ss, zaptest.NewLogger(t))
+
+	settings, err := rhp4.RPCSettings(context.Background(), transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fundAndSign := &fundAndSign{w, renterKey}
+	renterAllowance, hostCollateral := types.Siacoins(1000), types.Siacoins(2000)
+	formResult, err := rhp4.RPCFormContract(context.Background(), transport, cm, fundAndSign, cm.TipState(), settings.Prices, hostKey.PublicKey(), settings.WalletAddress, proto4.RPCFormContractParams{
+		RenterPublicKey: renterKey.PublicKey(),
+		RenterAddress:   w.Address(),
+		Allowance:       renterAllowance,
+		Collateral:      hostCollateral,
+		ProofHeight:     cm.Tip().Height + 50,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := formResult.Contract
+
+	// mine to confirm the contract
+	mineAndSync(t, cm, types.VoidAddress, 1, w, c)
+
+	cs := cm.TipState()
+
+	var balances []rhp4.AccountBalance
+	// add some random unknown accounts
+	for i := 0; i < 5; i++ {
+		balances = append(balances, rhp4.AccountBalance{
+			Account: proto4.Account(frand.Entropy256()),
+			Balance: types.ZeroCurrency,
+		})
+	}
+
+	var deposits []proto4.AccountDeposit
+	for i := 0; i < 10; i++ {
+		// fund an account with random values below 1SC
+		account1 := frand.Entropy256()
+		deposits = append(deposits, proto4.AccountDeposit{
+			Account: account1,
+			Amount:  types.NewCurrency64(frand.Uint64n(math.MaxUint64)),
+		})
+
+		// fund an account with 1SC
+		account2 := frand.Entropy256()
+		deposits = append(deposits, proto4.AccountDeposit{
+			Account: account2,
+			Amount:  types.Siacoins(1),
+		})
+
+		// fund an account with > 1SC
+		account3 := frand.Entropy256()
+		deposits = append(deposits, proto4.AccountDeposit{
+			Account: account3,
+			Amount:  types.Siacoins(1 + uint32(frand.Uint64n(5))),
+		})
+	}
+
+	// fund the initial set of accounts
+	fundResult, err := rhp4.RPCFundAccounts(context.Background(), transport, cs, renterKey, revision, deposits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fundResult.Balances) != len(deposits) {
+		t.Fatalf("expected %v, got %v", len(deposits), len(balances))
+	}
+	for i, deposit := range deposits {
+		if fundResult.Balances[i].Account != deposit.Account {
+			t.Fatalf("expected %v, got %v", deposit.Account, fundResult.Balances[i].Account)
+		} else if !fundResult.Balances[i].Balance.Equals(deposit.Amount) {
+			t.Fatalf("expected %v, got %v", deposit.Amount, fundResult.Balances[i].Balance)
+		}
+	}
+	revision.Revision = fundResult.Revision
+	balances = append(balances, fundResult.Balances...)
+
+	replenishParams := rhp4.RPCReplenishAccountsParams{
+		Contract: revision,
+		Target:   types.Siacoins(1),
+	}
+	var expectedCost types.Currency
+	for _, balance := range balances {
+		replenishParams.Accounts = append(replenishParams.Accounts, balance.Account)
+		if balance.Balance.Cmp(replenishParams.Target) < 0 {
+			expectedCost = expectedCost.Add(replenishParams.Target.Sub(balance.Balance))
+		}
+	}
+
+	// replenish the accounts
+	replenishResult, err := rhp4.RPCReplenishAccounts(context.Background(), transport, replenishParams, cs, fundAndSign)
+	if err != nil {
+		t.Fatal(err)
+	} else if !replenishResult.Usage.AccountFunding.Equals(expectedCost) {
+		t.Fatalf("expected %v, got %v", expectedCost, replenishResult.Usage.AccountFunding)
+	} else if len(replenishResult.Deposits) != len(replenishParams.Accounts) {
+		t.Fatalf("expected %v, got %v", len(replenishParams.Accounts), len(replenishResult.Deposits))
+	}
+	revisionTransfer := revision.Revision.RenterOutput.Value.Sub(replenishResult.Revision.RenterOutput.Value)
+	if !revisionTransfer.Equals(replenishResult.Usage.AccountFunding) {
+		t.Fatalf("expected %v, got %v", replenishResult.Usage.AccountFunding, revisionTransfer)
+	}
+	revision.Revision = replenishResult.Revision
+	assertValidRevision(t, cm, c, revision)
+
+	balanceMap := make(map[proto4.Account]types.Currency)
+	for _, account := range balances {
+		balance, err := rhp4.RPCAccountBalance(context.Background(), transport, account.Account)
+		if err != nil {
+			t.Fatal(err)
+		}
+		balanceMap[account.Account] = balance
+		if account.Balance.Cmp(replenishParams.Target) < 0 {
+			if !balance.Equals(replenishParams.Target) {
+				t.Fatalf("expected %v, got %v", replenishParams.Target, balance)
+			}
+		} else if !balance.Equals(account.Balance) {
+			// balances that were already >= 1SC should not have changed
+			t.Fatalf("expected %v, got %v", account.Balance, balance)
+		}
+	}
+
+	// call replenish again with the same accounts, the balances should not change
+	replenishParams.Contract = revision
+	replenishResult, err = rhp4.RPCReplenishAccounts(context.Background(), transport, replenishParams, cs, fundAndSign)
+	if err != nil {
+		t.Fatal(err)
+	} else if !replenishResult.Usage.AccountFunding.Equals(types.ZeroCurrency) {
+		t.Fatalf("expected %v, got %v", expectedCost, replenishResult.Usage.AccountFunding)
+	} else if len(replenishResult.Deposits) != len(replenishParams.Accounts) {
+		t.Fatalf("expected %v, got %v", len(replenishParams.Accounts), len(replenishResult.Deposits))
+	}
+	for _, deposit := range replenishResult.Deposits {
+		if !deposit.Amount.IsZero() {
+			t.Fatalf("expected zero, got %v", deposit.Amount)
+		}
+	}
+
+	for _, account := range balances {
+		balance, err := rhp4.RPCAccountBalance(context.Background(), transport, account.Account)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expected, ok := balanceMap[account.Account]
+		if !ok {
+			t.Fatalf("expected account not found")
+		} else if !balance.Equals(expected) {
+			t.Fatalf("expected %v, got %v", expected, balance)
+		}
+	}
+
+	assertValidRevision(t, cm, c, revision)
+}
+
 func TestAccounts(t *testing.T) {
 	n, genesis := testutil.V2Network()
 	hostKey, renterKey := types.GeneratePrivateKey(), types.GeneratePrivateKey()
@@ -1022,6 +1327,9 @@ func TestAppendSectors(t *testing.T) {
 	}
 	revision := formResult.Contract
 
+	// mine to confirm the contract
+	mineAndSync(t, cm, types.VoidAddress, 1, w, c)
+
 	assertLastRevision := func(t *testing.T) {
 		t.Helper()
 
@@ -1041,6 +1349,10 @@ func TestAppendSectors(t *testing.T) {
 			t.Fatal("renter signature invalid")
 		} else if !hostKey.PublicKey().VerifyHash(sigHash, lastRev.HostSignature) {
 			t.Fatal("host signature invalid")
+		}
+
+		if revision.Revision.RevisionNumber > 0 {
+			assertValidRevision(t, cm, c, revision)
 		}
 	}
 	assertLastRevision(t)
@@ -1242,6 +1554,9 @@ func TestRPCFreeSectors(t *testing.T) {
 	}
 	revision := formResult.Contract
 
+	// mine to confirm
+	mineAndSync(t, cm, types.VoidAddress, 1, w, c)
+
 	cs := cm.TipState()
 	account := proto4.Account(renterKey.PublicKey())
 
@@ -1268,16 +1583,21 @@ func TestRPCFreeSectors(t *testing.T) {
 		roots[i] = writeResult.Root
 	}
 
-	assertRevision := func(t *testing.T, revision types.V2FileContract, roots []types.Hash256) {
+	assertRevision := func(t *testing.T, revision rhp4.ContractRevision, roots []types.Hash256) {
 		t.Helper()
 
 		expectedRoot := proto4.MetaRoot(roots)
 		n := len(roots)
+		contract := revision.Revision
 
-		if revision.Filesize/proto4.SectorSize != uint64(n) {
-			t.Fatalf("expected %v sectors, got %v", n, revision.Filesize/proto4.SectorSize)
-		} else if revision.FileMerkleRoot != expectedRoot {
-			t.Fatalf("expected %v, got %v", expectedRoot, revision.FileMerkleRoot)
+		if contract.Filesize/proto4.SectorSize != uint64(n) {
+			t.Fatalf("expected %v sectors, got %v", n, contract.Filesize/proto4.SectorSize)
+		} else if contract.FileMerkleRoot != expectedRoot {
+			t.Fatalf("expected %v, got %v", expectedRoot, contract.FileMerkleRoot)
+		}
+
+		if contract.RevisionNumber > 0 {
+			assertValidRevision(t, cm, c, revision)
 		}
 	}
 
@@ -1286,8 +1606,8 @@ func TestRPCFreeSectors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertRevision(t, appendResult.Revision, roots)
 	revision.Revision = appendResult.Revision
+	assertRevision(t, revision, roots)
 
 	// randomly remove half the sectors
 	indices := make([]uint64, len(roots)/2)
@@ -1304,7 +1624,8 @@ func TestRPCFreeSectors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertRevision(t, removeResult.Revision, newRoots)
+	revision.Revision = removeResult.Revision
+	assertRevision(t, revision, newRoots)
 }
 
 func TestRPCSectorRoots(t *testing.T) {
@@ -1357,6 +1678,9 @@ func TestRPCSectorRoots(t *testing.T) {
 	}
 	revision := formResult.Contract
 
+	// mine to confirm
+	mineAndSync(t, cm, types.VoidAddress, 1, w, c)
+
 	cs := cm.TipState()
 	account := proto4.Account(renterKey.PublicKey())
 
@@ -1405,6 +1729,7 @@ func TestRPCSectorRoots(t *testing.T) {
 			t.Fatal(err)
 		}
 		revision.Revision = appendResult.Revision
+		assertValidRevision(t, cm, c, revision)
 		checkRoots(t, roots)
 	}
 }

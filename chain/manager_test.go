@@ -3,6 +3,7 @@ package chain
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	"go.sia.tech/core/consensus"
 	"go.sia.tech/core/types"
@@ -124,6 +125,16 @@ func TestTxPool(t *testing.T) {
 	}
 	cm := NewManager(store, tipState)
 
+	// add a listener
+	var changeSets [][]types.TransactionID
+	cm.OnPoolChange(func() {
+		var ids []types.TransactionID
+		for _, txn := range cm.PoolTransactions() {
+			ids = append(ids, txn.ID())
+		}
+		changeSets = append(changeSets, ids)
+	})
+
 	signTxn := func(txn *types.Transaction) {
 		for _, sci := range txn.SiacoinInputs {
 			sig := giftPrivateKey.SignHash(cm.TipState().WholeSigHash(*txn, types.Hash256(sci.ParentID), 0, 0, nil))
@@ -152,6 +163,8 @@ func TestTxPool(t *testing.T) {
 		t.Fatal(err)
 	} else if _, ok := cm.PoolTransaction(parentTxn.ID()); !ok {
 		t.Fatal("pool should contain parent transaction")
+	} else if len(changeSets) != 1 || len(changeSets[0]) != 1 || changeSets[0][0] != parentTxn.ID() {
+		t.Fatal("wrong change set:", changeSets)
 	}
 
 	// add another transaction, dependent on the first
@@ -168,6 +181,8 @@ func TestTxPool(t *testing.T) {
 		t.Fatal("child transaction without parent should be rejected")
 	} else if _, ok := cm.PoolTransaction(childTxn.ID()); ok {
 		t.Fatal("pool should not contain child transaction")
+	} else if len(changeSets) != 1 {
+		t.Fatal("wrong change set:", changeSets)
 	}
 	// the pool should identify the parent
 	if parents := cm.UnconfirmedParents(childTxn); len(parents) != 1 || parents[0].ID() != parentTxn.ID() {
@@ -180,6 +195,8 @@ func TestTxPool(t *testing.T) {
 		t.Fatal("pool should contain child transaction")
 	} else if len(cm.PoolTransactions()) != 2 {
 		t.Fatal("pool should contain both transactions")
+	} else if len(changeSets) != 2 || len(changeSets[1]) != 2 || changeSets[1][0] != parentTxn.ID() || changeSets[1][1] != childTxn.ID() {
+		t.Fatal("wrong change set:", changeSets)
 	}
 
 	// mine a block containing the transactions
@@ -200,5 +217,92 @@ func TestTxPool(t *testing.T) {
 	// the pool should be empty
 	if len(cm.PoolTransactions()) != 0 {
 		t.Fatal("pool should be empty after mining")
+	} else if len(changeSets) != 3 || len(changeSets[2]) != 0 {
+		t.Fatal("wrong change set:", changeSets)
+	}
+}
+
+func TestUpdateV2TransactionSet(t *testing.T) {
+	n, genesisBlock := TestnetZen()
+
+	n.InitialTarget = types.BlockID{0xFF}
+	n.HardforkV2.AllowHeight = 0
+
+	giftPrivateKey := types.GeneratePrivateKey()
+	giftPublicKey := giftPrivateKey.PublicKey()
+	giftAddress := types.StandardAddress(giftPublicKey)
+	giftAmountSC := types.Siacoins(100)
+	giftTxn := types.Transaction{
+		SiacoinOutputs: []types.SiacoinOutput{
+			{Address: giftAddress, Value: giftAmountSC},
+		},
+	}
+	genesisBlock.Transactions = []types.Transaction{giftTxn}
+
+	// construct a transaction that's valid at genesis
+	bs := consensus.V1BlockSupplement{Transactions: make([]consensus.V1TransactionSupplement, 1)}
+	cs, cau := consensus.ApplyBlock(n.GenesisState(), genesisBlock, bs, time.Time{})
+	txn := types.V2Transaction{
+		SiacoinInputs: []types.V2SiacoinInput{{
+			Parent: cau.SiacoinElementDiffs()[0].SiacoinElement,
+			SatisfiedPolicy: types.SatisfiedPolicy{
+				Policy:     types.PolicyPublicKey(giftPublicKey),
+				Signatures: []types.Signature{},
+			},
+		}},
+		MinerFee: giftAmountSC,
+	}
+	txn.SiacoinInputs[0].SatisfiedPolicy.Signatures = []types.Signature{giftPrivateKey.SignHash(cs.InputSigHash(txn))}
+
+	ms := consensus.NewMidState(cs)
+	if err := consensus.ValidateV2Transaction(ms, txn); err != nil {
+		t.Fatal(err)
+	}
+
+	// initialize chain manager and mine a mix of v1 and v2 blocks
+	store, genesisState, err := NewDBStore(NewMemDB(), n, genesisBlock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm := NewManager(store, genesisState)
+	for range 10 {
+		cs := cm.TipState()
+		b := types.Block{
+			ParentID:  cs.Index.ID,
+			Timestamp: types.CurrentTimestamp(),
+			MinerPayouts: []types.SiacoinOutput{{
+				Value:   cs.BlockReward(),
+				Address: frand.Entropy256(),
+			}},
+		}
+		if cs.Index.Height%2 == 0 {
+			b.V2 = &types.V2BlockData{
+				Height:     cs.Index.Height + 1,
+				Commitment: cs.Commitment(cs.TransactionsCommitment(b.Transactions, nil), b.MinerPayouts[0].Address),
+			}
+		}
+
+		findBlockNonce(cs, &b)
+		if err := cm.AddBlocks([]types.Block{b}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// transaction should not be valid at tip
+	ms = consensus.NewMidState(cm.TipState())
+	if err := consensus.ValidateV2Transaction(ms, txn); err == nil {
+		t.Fatal("transaction should not be valid at tip")
+	}
+
+	// update the transaction
+	txns := []types.V2Transaction{txn}
+	txns, err = cm.UpdateV2TransactionSet(txns, genesisState.Index, cm.Tip())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the transaction should now be valid
+	ms = consensus.NewMidState(cm.TipState())
+	if err := consensus.ValidateV2Transaction(ms, txns[0]); err != nil {
+		t.Fatal(err)
 	}
 }

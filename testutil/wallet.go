@@ -44,7 +44,7 @@ func (et *ephemeralWalletUpdateTxn) UpdateWalletSiacoinElementProofs(pu wallet.P
 	return nil
 }
 
-func (et *ephemeralWalletUpdateTxn) WalletApplyIndex(index types.ChainIndex, created, spent []types.SiacoinElement, events []wallet.Event, timestamp time.Time) error {
+func (et *ephemeralWalletUpdateTxn) WalletApplyIndex(index types.ChainIndex, created, spent []types.SiacoinElement, events []wallet.Event, _ time.Time) error {
 	for _, se := range spent {
 		if _, ok := et.store.utxos[types.SiacoinOutputID(se.ID)]; !ok {
 			panic(fmt.Sprintf("siacoin element %q does not exist", se.ID))
@@ -65,7 +65,7 @@ func (et *ephemeralWalletUpdateTxn) WalletApplyIndex(index types.ChainIndex, cre
 	return nil
 }
 
-func (et *ephemeralWalletUpdateTxn) WalletRevertIndex(index types.ChainIndex, removed, unspent []types.SiacoinElement, timestamp time.Time) error {
+func (et *ephemeralWalletUpdateTxn) WalletRevertIndex(index types.ChainIndex, removed, unspent []types.SiacoinElement, _ time.Time) error {
 	// remove any events that were added in the reverted block
 	filtered := et.store.events[:0]
 	for i := range et.store.events {
@@ -91,6 +91,8 @@ func (et *ephemeralWalletUpdateTxn) WalletRevertIndex(index types.ChainIndex, re
 
 // UpdateChainState applies and reverts chain updates to the wallet.
 func (es *EphemeralWalletStore) UpdateChainState(fn func(ux wallet.UpdateTx) error) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
 	return fn(&ephemeralWalletUpdateTxn{store: es})
 }
 

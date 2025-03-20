@@ -78,6 +78,7 @@ type Manager struct {
 	store         Store
 	tipState      consensus.State
 	onReorg       map[[16]byte]func(types.ChainIndex)
+	onPool        map[[16]byte]func()
 	invalidBlocks map[types.BlockID]error
 
 	// configuration options
@@ -249,9 +250,16 @@ func (m *Manager) AddBlocks(blocks []types.Block) error {
 		}
 		// release lock while notifying listeners
 		tip := m.tipState.Index
-		m.mu.Unlock()
+		fns := make([]func(), 0, len(m.onReorg)+len(m.onPool))
 		for _, fn := range m.onReorg {
-			fn(tip)
+			fns = append(fns, func() { fn(tip) })
+		}
+		for _, fn := range m.onPool {
+			fns = append(fns, fn)
+		}
+		m.mu.Unlock()
+		for _, fn := range fns {
+			fn()
 		}
 		m.mu.Lock()
 	}
@@ -456,9 +464,8 @@ func (m *Manager) UpdatesSince(index types.ChainIndex, maxBlocks int) (rus []Rev
 }
 
 // OnReorg adds fn to the set of functions that are called whenever the best
-// chain changes. It returns a function that removes fn from the set.
-//
-// The supplied function must not block or call any Manager methods.
+// chain changes. The fn is called with the new tip. It returns a function that
+// removes fn from the set.
 func (m *Manager) OnReorg(fn func(types.ChainIndex)) (cancel func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -468,6 +475,21 @@ func (m *Manager) OnReorg(fn func(types.ChainIndex)) (cancel func()) {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		delete(m.onReorg, key)
+	}
+}
+
+// OnPoolChange adds fn to the set of functions that are called whenever the
+// transaction pool may have changed. It returns a function that removes fn from
+// the set.
+func (m *Manager) OnPoolChange(fn func()) (cancel func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := frand.Entropy128()
+	m.onPool[key] = fn
+	return func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		delete(m.onPool, key)
 	}
 }
 
@@ -1082,14 +1104,13 @@ func (m *Manager) updateV2TransactionProofs(txns []types.V2Transaction, from, to
 		return nil, fmt.Errorf("reorg path from %v to %v is too long (-%v +%v)", from, to, len(revert), len(apply))
 	}
 	for _, index := range revert {
-		b, _, cs, ok := blockAndParent(m.store, index.ID)
+		b, bs, cs, ok := blockAndParent(m.store, index.ID)
 		if !ok {
 			return nil, fmt.Errorf("missing reverted block at index %v", index)
-		} else if b.V2 == nil {
-			return nil, fmt.Errorf("reorg path from %v to %v contains a non-v2 block (%v)", from, to, index)
+		} else if bs == nil {
+			bs = new(consensus.V1BlockSupplement)
 		}
-		// NOTE: since we are post-hardfork, we don't need a v1 supplement
-		cru := consensus.RevertBlock(cs, b, consensus.V1BlockSupplement{})
+		cru := consensus.RevertBlock(cs, b, *bs)
 		for i := range txns {
 			if !updateTxnProofs(&txns[i], cru.UpdateElementProof, cs.Elements.NumLeaves) {
 				return nil, fmt.Errorf("transaction %v references element that does not exist in our chain", txns[i].ID())
@@ -1098,14 +1119,14 @@ func (m *Manager) updateV2TransactionProofs(txns []types.V2Transaction, from, to
 	}
 
 	for _, index := range apply {
-		b, _, cs, ok := blockAndParent(m.store, index.ID)
+		b, bs, cs, ok := blockAndParent(m.store, index.ID)
 		if !ok {
 			return nil, fmt.Errorf("missing applied block at index %v", index)
-		} else if b.V2 == nil {
-			return nil, fmt.Errorf("reorg path from %v to %v contains a non-v2 block (%v)", from, to, index)
+		} else if bs == nil {
+			bs = new(consensus.V1BlockSupplement)
 		}
-		// NOTE: since we are post-hardfork, we don't need a v1 supplement or ancestorTimestamp
-		cs, cau := consensus.ApplyBlock(cs, b, consensus.V1BlockSupplement{}, time.Time{})
+		ancestorTimestamp, _ := m.store.AncestorTimestamp(b.ParentID)
+		cs, cau := consensus.ApplyBlock(cs, b, *bs, ancestorTimestamp)
 
 		// get the transactions that were confirmed in this block
 		confirmedTxns := make(map[types.TransactionID]bool)
@@ -1200,6 +1221,18 @@ func (m *Manager) AddPoolTransactions(txns []types.Transaction) (known bool, err
 	// invalidate caches
 	m.txpool.medianFee = nil
 	m.txpool.parentMap = nil
+
+	// release lock while notifying listeners
+	fns := make([]func(), 0, len(m.onPool))
+	for _, fn := range m.onPool {
+		fns = append(fns, fn)
+	}
+	m.mu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+	m.mu.Lock()
+
 	return false, nil
 }
 
@@ -1269,6 +1302,18 @@ func (m *Manager) AddV2PoolTransactions(basis types.ChainIndex, txns []types.V2T
 	// invalidate caches
 	m.txpool.medianFee = nil
 	m.txpool.parentMap = nil
+
+	// release lock while notifying listeners
+	fns := make([]func(), 0, len(m.onPool))
+	for _, fn := range m.onPool {
+		fns = append(fns, fn)
+	}
+	m.mu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+	m.mu.Lock()
+
 	return false, nil
 }
 
@@ -1279,6 +1324,7 @@ func NewManager(store Store, cs consensus.State, opts ...ManagerOption) *Manager
 		store:         store,
 		tipState:      cs,
 		onReorg:       make(map[[16]byte]func(types.ChainIndex)),
+		onPool:        make(map[[16]byte]func()),
 		invalidBlocks: make(map[types.BlockID]error),
 	}
 	for _, opt := range opts {
